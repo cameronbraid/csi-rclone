@@ -301,6 +301,7 @@ func (ns *nodeServer) Mount(remote string, remotePath string, targetPath string,
 	err = cmd.Start()
 
 	if err != nil {
+		cmd.Wait()
 		return fmt.Errorf("mounting failed: %v cmd: '%s' remote: ':%s:%s' targetpath: %s output: %q",
 			err, mountCmd, remote, remotePath, targetPath, string(b.Bytes()))
 	}
