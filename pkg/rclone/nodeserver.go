@@ -1,11 +1,14 @@
 package rclone
 
 import (
+	"bytes"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"os/exec"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -17,14 +20,14 @@ import (
 	"google.golang.org/grpc/status"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/kubernetes/pkg/util/mount"
-	"k8s.io/kubernetes/pkg/volume/util"
 
 	csicommon "github.com/kubernetes-csi/drivers/pkg/csi-common"
 )
 
 type nodeServer struct {
 	*csicommon.DefaultNodeServer
-	mounter *mount.SafeFormatAndMount
+	mounter         *mount.SafeFormatAndMount
+	rcloneProcesses map[string]*os.Process
 }
 
 type mountPoint struct {
@@ -67,6 +70,7 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 			klog.Errorf("Unmount directory %s failed with %v", targetPath, err)
 			return nil, err
 		}
+
 	}
 
 	mountOptions := req.GetVolumeCapability().GetMount().GetMountFlags()
@@ -83,7 +87,7 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		return nil, e
 	}
 
-	e = Mount(remote, remotePath, targetPath, flags)
+	e = ns.Mount(remote, remotePath, targetPath, flags)
 	if e != nil {
 		if os.IsPermission(e) {
 			return nil, status.Error(codes.PermissionDenied, e.Error())
@@ -103,7 +107,7 @@ func extractFlags(volumeContext map[string]string, secret *v1.Secret) (string, s
 	flags := make(map[string]string)
 
 	// Secret values are default, gets merged and overriden by corresponding PV values
-	if secret !=nil && secret.Data != nil && len(secret.Data) > 0 {
+	if secret != nil && secret.Data != nil && len(secret.Data) > 0 {
 
 		// Needs byte to string casting for map values
 		for k, v := range secret.Data {
@@ -152,18 +156,45 @@ func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 	if err != nil && !mount.IsCorruptedMnt(err) {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
-	
+
 	if notMnt && !mount.IsCorruptedMnt(err) {
 		klog.Infof("Volume not mounted")
-	
+
 	} else {
-		err = util.UnmountPath(req.GetTargetPath(), m)
-		if err != nil {
-			klog.Error("Error while unmounting path")
-			return nil, status.Error(codes.Internal, err.Error())
-		}
+
+		// err = m.Unmount(req.GetTargetPath())
+		// // err = util.UnmountPath(req.GetTargetPath(), m)
+		// if err != nil {
+		// 	klog.Error("Error while unmounting path")
+		// 	return nil, status.Error(codes.Internal, err.Error())
+		// }
+
+		// klog.Infof("Volume %s unmounted successfully", req.VolumeId)
+
+		p := ns.rcloneProcesses[targetPath]
+
+		var exited uint32
+
+		p.Signal(os.Interrupt)
+
+		go func() {
+			start := time.Now()
+			for time.Since(start) < 5*time.Second && exited == 0 {
+				time.Sleep(time.Millisecond * 500)
+			}
+			if exited == 0 {
+				p.Kill()
+			}
+		}()
+
+		klog.Infof("Waiting for rclone mount to exit for %s ", targetPath)
+		p.Wait()
+		atomic.AddUint32(&exited, 1)
+
+		delete(ns.rcloneProcesses, targetPath)
 
 		klog.Infof("Volume %s unmounted successfully", req.VolumeId)
+
 	}
 
 	return &csi.NodeUnpublishVolumeResponse{}, nil
@@ -219,7 +250,7 @@ func getSecret(secretName string) (*v1.Secret, error) {
 }
 
 // func Mount(params mountParams, target string, opts ...string) error {
-func Mount(remote string, remotePath string, targetPath string, flags map[string]string) error {
+func (ns *nodeServer) Mount(remote string, remotePath string, targetPath string, flags map[string]string) error {
 	mountCmd := "rclone"
 	mountArgs := []string{}
 
@@ -237,7 +268,7 @@ func Mount(remote string, remotePath string, targetPath string, flags map[string
 		"mount",
 		fmt.Sprintf(":%s:%s", remote, remotePath),
 		targetPath,
-		"--daemon",
+		// "--daemon",
 	)
 
 	// Add default flags
@@ -261,11 +292,18 @@ func Mount(remote string, remotePath string, targetPath string, flags map[string
 
 	klog.Infof("executing mount command cmd=%s, remote=:%s:%s, targetpath=%s", mountCmd, remote, remotePath, targetPath)
 
-	out, err := exec.Command(mountCmd, mountArgs...).CombinedOutput()
+	cmd := exec.Command(mountCmd, mountArgs...)
+	cmd.Env = os.Environ()
+	cmd.Env = append(cmd.Env, "GOMAXPROCS=3") // try workaround for zombies https://github.com/rclone/rclone/issues/3259
+	var b bytes.Buffer
+	cmd.Stdout = &b
+	cmd.Stderr = &b
+	err = cmd.Start()
+
 	if err != nil {
 		return fmt.Errorf("mounting failed: %v cmd: '%s' remote: ':%s:%s' targetpath: %s output: %q",
-			err, mountCmd, remote, remotePath, targetPath, string(out))
+			err, mountCmd, remote, remotePath, targetPath, string(b.Bytes()))
 	}
-
+	ns.rcloneProcesses[targetPath] = cmd.Process
 	return nil
 }
